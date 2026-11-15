@@ -8,6 +8,7 @@ import math
 import re
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from .db import connect
 
@@ -111,6 +112,25 @@ def ingest(rows: list[tuple[str, int, float]]) -> dict:
     hours_written = 0
     try:
         conn.execute("BEGIN IMMEDIATE")  # serialize writers across instances
+
+        # Reject the whole batch if any meter in it carries a reading earlier
+        # than that meter's seal cutoff. Checked inside the write transaction
+        # so a concurrent seal cannot move the boundary underneath us.
+        meters = sorted({meter for meter, _ts, _kwh in rows})
+        placeholders = ",".join("?" for _ in meters)
+        sealed = {
+            r["meter_id"]: r["cutoff_second"]
+            for r in conn.execute(
+                f"SELECT meter_id, cutoff_second FROM seals "
+                f"WHERE meter_id IN ({placeholders})", meters).fetchall()}
+        for meter, ts, _kwh in rows:
+            cutoff = sealed.get(meter)
+            if cutoff is not None and ts < cutoff:
+                raise ConflictError(
+                    f"meter {meter!r} is sealed at {cutoff} ({utc_iso(cutoff)}); "
+                    f"reading at {ts} ({utc_iso(ts)}) is before the cutoff, "
+                    f"whole batch rejected")
+
         conn.execute(
             "INSERT INTO batches (batch_id, received_at, rows_total, rows_inserted,"
             " rows_deduplicated) VALUES (?,?,?,0,0)",
@@ -164,15 +184,25 @@ def recompute_window(conn, meter: str, tmin: int, tmax: int) -> int:
     The window extends to the neighbouring stored readings on both sides, so
     when a late reading fills a gap the hours before and after it are
     recomputed in the same transaction.
+
+    When the meter is sealed, the window is clamped to the seal cutoff: hourly
+    rows with hour_start < cutoff are frozen billing evidence and must never be
+    deleted or rewritten, even after the raw readings behind them were purged.
     """
+    seal = conn.execute(
+        "SELECT cutoff_second FROM seals WHERE meter_id = ?", (meter,)).fetchone()
+    floor = seal["cutoff_second"] if seal is not None else 0
+
     row = conn.execute(
         "SELECT MAX(utc_second) AS t FROM readings WHERE meter_id = ? AND utc_second < ?",
         (meter, tmin)).fetchone()
-    lo = row["t"] if row["t"] is not None else tmin
+    lo = max(floor, row["t"] if row["t"] is not None else tmin)
     row = conn.execute(
         "SELECT MIN(utc_second) AS t FROM readings WHERE meter_id = ? AND utc_second > ?",
         (meter, tmax)).fetchone()
     hi = row["t"] if row["t"] is not None else tmax
+    if lo >= hi:
+        return 0  # everything the new reading could touch is already frozen
 
     conn.execute(
         "DELETE FROM hourly_usage WHERE meter_id = ? AND hour_start >= ? AND hour_start < ?",
@@ -208,3 +238,103 @@ def _insert_hour(conn, meter: str, hour_start: int, kwh_used, billable: int, rea
         "INSERT INTO hourly_usage (meter_id, hour_start, kwh_used, billable, reason)"
         " VALUES (?,?,?,?,?)",
         (meter, hour_start, kwh_used, billable, reason))
+
+
+def seal_meter(meter: str, cutoff: int) -> dict:
+    """Seal one meter at a UTC hour boundary, atomically.
+
+    Rules:
+    - A reading at exactly the cutoff second must already exist; the cutoff is
+      the anchor baseline for the hours that follow it.
+    - Raw readings strictly before the cutoff are purged; hourly results before
+      it stay queryable and are never recomputed afterwards.
+    - Re-sealing with the same cutoff is an idempotent no-op (nothing is purged
+      twice). The cutoff can only move forward; moving it back is a conflict.
+    - Seal position, purge and preserved hourly results commit together, so
+      concurrent seal/ingest operations never observe a half-finished state;
+      any failure rolls back and leaves prior results fully intact.
+    """
+    sealed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")  # serialize against ingests and other seals
+
+        seal = conn.execute(
+            "SELECT cutoff_second FROM seals WHERE meter_id = ?", (meter,)).fetchone()
+        previous_cutoff = seal["cutoff_second"] if seal is not None else None
+        if previous_cutoff is not None and cutoff < previous_cutoff:
+            raise ConflictError(
+                f"meter {meter!r} is already sealed at {previous_cutoff} "
+                f"({utc_iso(previous_cutoff)}); the cutoff can only move forward, "
+                f"requested {cutoff} ({utc_iso(cutoff)}) is earlier")
+
+        anchor = conn.execute(
+            "SELECT kwh FROM readings WHERE meter_id = ? AND utc_second = ?",
+            (meter, cutoff)).fetchone()
+        if anchor is None:
+            raise ConflictError(
+                f"cannot seal meter {meter!r} at {cutoff} ({utc_iso(cutoff)}): "
+                f"no reading stored at that hour; a reading at the cutoff hour is required")
+
+        # Purge only what is earlier than the cutoff and still retained, so a
+        # retry at the same cutoff deletes nothing (idempotent).
+        purge_bound = cutoff if previous_cutoff is None else max(previous_cutoff, cutoff)
+        cur = conn.execute(
+            "DELETE FROM readings WHERE meter_id = ? AND utc_second < ?",
+            (meter, purge_bound))
+        rows_deleted = cur.rowcount
+
+        if previous_cutoff is None:
+            conn.execute(
+                "INSERT INTO seals (meter_id, cutoff_second, sealed_at) VALUES (?,?,?)",
+                (meter, cutoff, sealed_at))
+        else:
+            conn.execute(
+                "UPDATE seals SET cutoff_second = ?, sealed_at = ? WHERE meter_id = ?",
+                (cutoff, sealed_at, meter))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+    remaining = None
+    check = connect()
+    try:
+        row = check.execute(
+            "SELECT COUNT(*) AS n FROM readings WHERE meter_id = ?", (meter,)).fetchone()
+        remaining = row["n"]
+    finally:
+        check.close()
+
+    return {
+        "meter_id": meter,
+        "cutoff_second": cutoff,
+        "cutoff_utc": utc_iso(cutoff),
+        "previous_cutoff_second": previous_cutoff,
+        "idempotent_retry": previous_cutoff == cutoff,
+        "readings_deleted": rows_deleted,
+        "readings_remaining": remaining,
+        "sealed_at": sealed_at,
+    }
+
+
+def list_seals(meter: Optional[str] = None) -> list[dict]:
+    """Return seal records (optionally for one meter), newest cutoff first."""
+    conn = connect()
+    try:
+        if meter is not None:
+            rows = conn.execute(
+                "SELECT meter_id, cutoff_second, sealed_at FROM seals "
+                "WHERE meter_id = ? ORDER BY cutoff_second DESC", (meter,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT meter_id, cutoff_second, sealed_at FROM seals "
+                "ORDER BY cutoff_second DESC, meter_id").fetchall()
+    finally:
+        conn.close()
+    return [{"meter_id": r["meter_id"], "cutoff_second": r["cutoff_second"],
+             "cutoff_utc": utc_iso(r["cutoff_second"]), "sealed_at": r["sealed_at"]}
+            for r in rows]

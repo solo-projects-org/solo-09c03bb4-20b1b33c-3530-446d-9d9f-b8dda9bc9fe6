@@ -2,9 +2,13 @@
 
 Design notes for concurrency (two API instances sharing one SQLite file):
 - WAL journal mode lets readers proceed while a writer holds the write lock.
-- Every ingest runs inside a single BEGIN IMMEDIATE transaction, so writers
-  serialize and each committed batch is atomic: raw readings and the
-  recomputed hourly usage become visible together, never mixed.
+- Every ingest and every seal run inside a single BEGIN IMMEDIATE transaction,
+  so writers serialize and each commit is atomic: raw readings and the
+  recomputed hourly usage, or the seal position and purged readings, become
+  visible together, never mixed.
+- The seals cutoff is read inside the same write transaction that stores a
+  batch, so a concurrent seal cannot move the boundary between the check and
+  the insert.
 - busy_timeout makes a second writer wait for the first one instead of
   failing with SQLITE_BUSY.
 """
@@ -38,6 +42,15 @@ CREATE TABLE IF NOT EXISTS hourly_usage (
     billable   INTEGER NOT NULL,              -- 1 billable / 0 not billable
     reason     TEXT NOT NULL,                 -- ok | gap | rollback
     PRIMARY KEY (meter_id, hour_start)
+);
+
+-- One row per sealed meter. cutoff_second is a UTC hour boundary: raw readings
+-- strictly before it have been purged and the hourly results before it are
+-- frozen. The cutoff can only move forward (to a larger hour boundary).
+CREATE TABLE IF NOT EXISTS seals (
+    meter_id       TEXT PRIMARY KEY,
+    cutoff_second  INTEGER NOT NULL,          -- UTC hour-aligned; readings < this are purged
+    sealed_at      TEXT NOT NULL              -- ISO-8601 UTC of the latest seal action
 );
 """
 

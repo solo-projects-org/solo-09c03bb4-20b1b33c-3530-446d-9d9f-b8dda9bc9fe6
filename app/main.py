@@ -6,11 +6,11 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .db import connect, init_db
-from .logic import (HOUR, ConflictError, ValidationError, ingest, parse_csv,
-                    utc_iso)
+from .logic import (HOUR, ConflictError, ValidationError, ingest, list_seals,
+                    parse_csv, seal_meter, utc_iso)
 
 
 @asynccontextmanager
@@ -21,13 +21,15 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Park Energy Backfill API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Receives backfilled cumulative meter readings (CSV), keeps exactly one "
         "copy of identical retransmissions, rejects batches that contradict "
         "stored readings, and derives billable hourly kWh for the billing team. "
-        "Upload samples via the file picker below, then query /readings and "
-        "/hourly-usage."),
+        "POST /seals archives a meter at a UTC hour cutoff: raw readings before "
+        "the cutoff are purged while the already-derived hourly results stay "
+        "queryable and frozen. Upload samples via the file picker below, then "
+        "query /readings and /hourly-usage."),
     lifespan=lifespan,
 )
 
@@ -69,12 +71,40 @@ class BatchOut(BaseModel):
     rows_deduplicated: int
 
 
+class SealRequest(BaseModel):
+    meter_id: str = Field(..., min_length=1, max_length=128,
+                          description="meter identifier to seal")
+    cutoff_second: int = Field(
+        ..., ge=0,
+        description="UTC hour-aligned cutoff second; a reading at this exact "
+                    "hour must already exist")
+
+
+class SealResponse(BaseModel):
+    meter_id: str
+    cutoff_second: int
+    cutoff_utc: str
+    previous_cutoff_second: Optional[int]
+    idempotent_retry: bool
+    readings_deleted: int
+    readings_remaining: int
+    sealed_at: str
+
+
+class SealOut(BaseModel):
+    meter_id: str
+    cutoff_second: int
+    cutoff_utc: str
+    sealed_at: str
+
+
 # ---------- ingest ----------
 
 @app.post("/batches", response_model=IngestResponse, status_code=201,
           summary="Upload a CSV batch of cumulative readings",
           responses={
-              409: {"description": "Batch contradicts stored readings; nothing was saved"},
+              409: {"description": "Batch contradicts stored readings or contains a "
+                                    "reading before the meter's seal cutoff; nothing was saved"},
               415: {"description": "Unsupported content type"},
               422: {"description": "CSV failed validation; nothing was saved"},
           })
@@ -112,6 +142,44 @@ async def _extract_csv_text(request: Request, file: Optional[UploadFile]) -> str
         return data.decode("utf-8-sig")  # tolerate a BOM
     except UnicodeDecodeError:
         raise HTTPException(status_code=422, detail="CSV must be UTF-8 encoded")
+
+
+# ---------- sealing / retention ----------
+
+@app.post("/seals", response_model=SealResponse,
+          summary="Seal a meter at a UTC hour cutoff and purge earlier raw readings",
+          responses={
+              409: {"description": "No reading at the cutoff, or cutoff moved "
+                                    "backwards; nothing was changed"},
+              422: {"description": "cutoff_second missing, negative or not hour-aligned"},
+          })
+def create_seal(payload: SealRequest):
+    """Archive a meter at `cutoff_second` (a UTC hour boundary).
+
+    - A reading at exactly the cutoff hour must already exist.
+    - Raw readings strictly before the cutoff are deleted; the hourly kWh,
+      billable flag and reason already derived for earlier hours remain
+      queryable through /hourly-usage and never change afterwards.
+    - Hours starting at or after the cutoff keep accepting late backfills.
+    - Batches containing any reading of this meter earlier than the cutoff are
+      rejected wholesale by POST /batches.
+    - Retrying the same cutoff changes nothing (idempotent); the cutoff may
+      only move forward.
+    """
+    if payload.cutoff_second % HOUR != 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"cutoff_second must be aligned to a UTC hour, got {payload.cutoff_second}")
+    try:
+        return seal_meter(payload.meter_id, payload.cutoff_second)
+    except ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.get("/seals", response_model=list[SealOut],
+         summary="Seal positions of meters (optionally one meter)")
+def get_seals(meter_id: Optional[str] = Query(None, description="filter by meter")):
+    return list_seals(meter_id)
 
 
 # ---------- queries ----------
